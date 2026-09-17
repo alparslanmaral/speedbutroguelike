@@ -1,5 +1,5 @@
 // =====================================================================
-// INFERNO SPEED — Speed card game turned into a Balatro-style roguelike
+// INFERNO SPEED — single-player Speed turned into a Balatro-style roguelike
 // =====================================================================
 
 // === CONSTANTS ===
@@ -8,12 +8,12 @@ const SUIT_SYMBOL = { hearts: '♥', diamonds: '♦', spades: '♠', clubs: '♣
 const RANK_LABEL = { 1: 'A', 11: 'J', 12: 'Q', 13: 'K' };
 
 const anteTimeLimits = [240, 210, 185, 165, 145, 130, 115, 100, 90, 75]; // seconds
-const anteCardCounts = [15, 15, 16, 16, 17, 17, 18, 18, 19, 20];        // cards per player
+const anteCardCounts = [20, 21, 22, 23, 24, 25, 26, 27, 28, 30];        // cards dealt to the player
 const TOTAL_ANTES = anteTimeLimits.length;
 const BOSS_TIME_FACTOR = 0.75;
 const BASE_HAND_SIZE = 5;
 const BASE_REFILL_DELAY = 350;   // ms until hand refills from stock
-const STALEMATE_DELAY = 1200;    // ms of mutual deadlock before flipping
+const BASE_FLIP_DELAY = 1000;    // ms of being stuck before reserves flip automatically
 const SHOP_SIZE = 3;
 const REROLL_COST = 3;
 const SAVE_KEY = 'infernoSpeedSave';
@@ -44,8 +44,8 @@ const ALL_MARKET_ITEMS = [
   { key: 'infinity_loop', name: 'Infinity Loop', price: 12, type: 'joker', desc: 'King-to-Ace and Ace-to-King wraps now count as valid moves.' },
   { key: 'quick_hands', name: 'Quick Hands', price: 10, type: 'joker', desc: 'Side-pile draw delay is reduced by 30%.' },
   { key: 'steady_hand', name: 'Steady Hand', price: 14, type: 'joker', desc: 'Maximum hand size is increased by 1.' },
-  { key: 'light_load', name: 'Light Load', price: 11, type: 'joker', desc: 'You are dealt 2 fewer cards at the start of every ante.' },
-  { key: 'devils_lull', name: "Devil's Lull", price: 9, type: 'joker', desc: 'The Devil plays 30% slower.' },
+  { key: 'light_load', name: 'Light Load', price: 11, type: 'joker', desc: 'You are dealt 3 fewer cards at the start of every ante.' },
+  { key: 'deep_reserves', name: 'Deep Reserves', price: 8, type: 'joker', desc: '+2 seconds whenever the reserves are flipped.' },
   { key: 'time_dilation', name: 'Time Dilation', price: 13, type: 'joker', desc: 'Every ante timer starts with +15 seconds.' },
   { key: 'second_wind', name: 'Second Wind', price: 18, type: 'joker', desc: 'Consumed once: the first time the timer would hit zero, grants +10 seconds instead.' },
   { key: 'chain_reaction', name: 'Chain Reaction', price: 9, type: 'joker', desc: 'Playing 3 cards within 2 seconds grants +3 seconds.' },
@@ -77,8 +77,8 @@ const bossModifiers = [
   { key: 'locked_number', name: 'Sealed Rank', desc: 'A randomly chosen rank cannot be played this ante.' },
   { key: 'hand_of_four', name: 'Hand of Four', desc: 'Maximum hand size is 4 instead of 5 this ante.' },
   { key: 'no_joker_effects', name: 'Silenced Power', desc: 'Half of your owned jokers (randomly chosen) are disabled this ante.' },
-  { key: 'devils_pace', name: "Devil's Pace", desc: 'The Devil plays twice as fast this ante.' },
-  { key: 'heavy_hand', name: 'Heavy Hand', desc: 'You are dealt 4 extra cards this ante.' },
+  { key: 'frozen_reserve', name: 'Frozen Reserve', desc: 'You cannot flip the reserves manually. Stuck? Wait 3 seconds for the automatic flip.' },
+  { key: 'heavy_hand', name: 'Heavy Hand', desc: 'You are dealt 5 extra cards this ante.' },
   { key: 'greedy_devil', name: 'Greedy Devil', desc: "This ante's chip reward is halved." },
 ];
 const BOSS_CONFLICTS = [['no_red', 'no_black']];
@@ -92,7 +92,7 @@ let currentAnte = 1;
 let runActive = false;
 
 // === ANTE STATE (per ante) ===
-let playerHand = [], playerStock = [], devilHand = [], devilStock = [];
+let playerHand = [], playerStock = [];
 let centerPiles = [[], []];
 let sidePiles = [[], []];
 let preparedPool = [];
@@ -104,12 +104,11 @@ let disabledJokers = [];
 let secondWindUsed = false;
 let anteChipsEarned = 0, anteTimeGained = 0, cardsPlayedThisAnte = 0;
 let recentPlayTimes = [];
-let devilFinished = false;
-let playerInitialCards = 0, devilInitialCards = 0;
+let playerInitialCards = 0;
 let selectedPile = null;
 let lastTick = 0;
 let cardIdCounter = 0;
-let timers = { loop: null, refill: null, devil: null, stalemate: null, toast: null };
+let timers = { loop: null, refill: null, flip: null, toast: null };
 
 // === SHOP STATE ===
 let nextMarketItems = [];
@@ -158,6 +157,8 @@ function getMods() {
   const m = {
     handSize: BASE_HAND_SIZE + (has('steady_hand') ? 1 : 0),
     refillDelay: hasBoss('slow_draw') ? 1500 : BASE_REFILL_DELAY,
+    flipDelay: hasBoss('frozen_reserve') ? 3000 : BASE_FLIP_DELAY,
+    manualFlip: !hasBoss('frozen_reserve'),
     wrap: has('infinity_loop'),
     rankStep: hasBoss('reverse_rule') ? 2 : 1,
     redAbundance: has('crimson_abundance'),
@@ -165,8 +166,7 @@ function getMods() {
     sevenfold: has('sevenfold'),
     gutterDeck: has('gutter_deck'),
     royalCourt: has('royal_court'),
-    startCardsDelta: (has('light_load') ? -2 : 0) + (hasBoss('heavy_hand') ? 4 : 0),
-    devilSpeedMult: (has('devils_lull') ? 1.3 : 1) * (hasBoss('devils_pace') ? 0.5 : 1),
+    startCardsDelta: (has('light_load') ? -3 : 0) + (hasBoss('heavy_hand') ? 5 : 0),
     timeBonus: has('time_dilation') ? 15 : 0,
     priceMult: ownedMarketItems.includes('devils_bargain') ? 0.8 : 1,
   };
@@ -303,17 +303,18 @@ function prepareAnte() {
   timeRemaining = anteTimeLimit;
 
   preparedPool = buildPool();
+  playerHand = []; playerStock = []; centerPiles = [[], []]; sidePiles = [[], []];
   runActive = true;
   saveProgress();
 
   showScreen('game');
-  renderHud();
+  renderAll();
   if (boss) showBossModal(); else showDeckModal();
 }
 
 function showBossModal() {
   const final = isFinalAnte(currentAnte);
-  $('boss-title').textContent = final ? '👿 The Devil Himself' : `⚠ Boss Ante ${currentAnte}`;
+  $('boss-title').textContent = final ? 'The Devil Himself' : `Boss Ante ${currentAnte}`;
   $('boss-mod-list').innerHTML = activeBossModifiers.map((m) => {
     let desc = m.desc;
     if (m.key === 'locked_number') desc = `All ${rankLabel(sealedRank)}s cannot be played this ante.`;
@@ -332,12 +333,12 @@ function showDeckModal() {
   const red = preparedPool.filter(isRed).length;
   const enh = preparedPool.filter((c) => c.enhancement);
   $('deck-summary').innerHTML = `
-    <span>Total: <b>${total}</b></span>
-    <span>Red: <b>${red}</b></span>
-    <span>Black: <b>${total - red}</b></span>
-    <span>Enhanced: <b>${enh.length}</b></span>
-    <span>Time limit: <b>${anteTimeLimit}s</b></span>
-    <span>Dealt to you: <b>${dealCount()}</b></span>`;
+    <span>Total<b>${total}</b></span>
+    <span>Red<b>${red}</b></span>
+    <span>Black<b>${total - red}</b></span>
+    <span>Enhanced<b>${enh.length}</b></span>
+    <span>Time limit<b>${anteTimeLimit}s</b></span>
+    <span>Dealt to you<b>${dealCount()}</b></span>`;
   $('deck-grid').innerHTML = comp.map((e) => {
     const card = { suit: e.suit, rank: e.rank, enhancement: e.enhancement };
     const boosted = !e.enhancement && e.count > 1;
@@ -355,7 +356,7 @@ function showDeckModal() {
 
 function dealCount() {
   const base = anteCardCounts[currentAnte - 1] + getMods().startCardsDelta;
-  return clamp(base, 8, Math.floor(preparedPool.length / 2) - 2);
+  return clamp(base, 10, preparedPool.length - 6);
 }
 
 function startAnte() {
@@ -363,24 +364,17 @@ function startAnte() {
   const pool = shuffle(preparedPool.slice());
   const count = dealCount();
 
-  const playerAll = pool.splice(0, count);
-  const devilAll = pool.splice(0, count);
+  playerHand = [];
+  playerStock = pool.splice(0, count);
   centerPiles = [[pool.pop()], [pool.pop()]];
   const half = Math.ceil(pool.length / 2);
   sidePiles = [pool.slice(0, half), pool.slice(half)];
-
-  playerHand = [];
-  playerStock = playerAll;
-  devilHand = devilAll.splice(0, BASE_HAND_SIZE);
-  devilStock = devilAll;
   playerInitialCards = count;
-  devilInitialCards = count;
 
   timeRemaining = anteTimeLimit;
   secondWindUsed = false;
   anteChipsEarned = 0; anteTimeGained = 0; cardsPlayedThisAnte = 0;
   recentPlayTimes = [];
-  devilFinished = false;
   selectedPile = null;
 
   refillHandNow();
@@ -393,10 +387,10 @@ function startAnte() {
 
 function stopLoop() {
   anteRunning = false;
-  for (const k of ['loop', 'refill', 'devil', 'stalemate']) {
+  for (const k of ['loop', 'refill', 'flip']) {
     if (timers[k]) { clearInterval(timers[k]); clearTimeout(timers[k]); timers[k] = null; }
   }
-  $('stalemate-banner').hidden = true;
+  $('btn-flip').hidden = true;
 }
 
 function gameLoop() {
@@ -420,8 +414,7 @@ function gameLoop() {
       return;
     }
   }
-  devilThink();
-  checkStalemate();
+  checkStuck();
   renderTimer();
 }
 
@@ -441,7 +434,7 @@ function topOf(pileIdx) {
   return p.length ? p[p.length - 1] : null;
 }
 
-function canPlayerPlay(card, pileIdx) {
+function canPlay(card, pileIdx) {
   const top = topOf(pileIdx);
   if (!top) return true;
   if (!rankDiffValid(card.rank, top.rank)) return false;
@@ -451,13 +444,7 @@ function canPlayerPlay(card, pileIdx) {
   return true;
 }
 
-function canDevilPlay(card, pileIdx) {
-  const top = topOf(pileIdx);
-  return !top || rankDiffValid(card.rank, top.rank);
-}
-
-const playerHasMove = () => playerHand.some((c) => [0, 1].some((p) => canPlayerPlay(c, p)));
-const devilHasMove = () => !devilFinished && devilHand.some((c) => [0, 1].some((p) => canDevilPlay(c, p)));
+const playerHasMove = () => playerHand.some((c) => [0, 1].some((p) => canPlay(c, p)));
 
 // =====================================================================
 // === PLAYER ACTIONS ===
@@ -469,8 +456,8 @@ function playerPlayCard(cardId, pileIdx = null) {
   const card = playerHand[idx];
 
   let target = pileIdx !== null ? pileIdx : selectedPile;
-  if (target === null) target = [0, 1].find((p) => canPlayerPlay(card, p));
-  if (target === undefined || target === null || !canPlayerPlay(card, target)) {
+  if (target === null) target = [0, 1].find((p) => canPlay(card, p));
+  if (target === undefined || target === null || !canPlay(card, target)) {
     const el = document.querySelector(`#player-hand .card[data-id="${cardId}"]`);
     if (el) { el.classList.add('shake'); setTimeout(() => el.classList.remove('shake'), 300); }
     return;
@@ -551,15 +538,19 @@ function onPlayerCardPlayed(card) {
     }
   }
 
+  grantBonus(chips, secs);
+  if (notes.length) showToast(notes.join(' '), 1200);
+}
+
+function grantBonus(chips, secs) {
   if (chips > 0) {
     userChips += chips; anteChipsEarned += chips;
-    floatText(`+${chips} 🪙`, 'chips');
+    floatText(`+${chips} chips`, 'chips');
   }
   if (secs > 0) {
     timeRemaining += secs; anteTimeGained += secs;
-    floatText(`+${secs}s`, 'time', 40);
+    floatText(`+${secs}s`, 'time', 60);
   }
-  if (notes.length) showToast(notes.join(' '), 1200);
 }
 
 function checkWin() {
@@ -568,74 +559,39 @@ function checkWin() {
 }
 
 // =====================================================================
-// === THE DEVIL (AI) ===
+// === STUCK / FLIPPING RESERVES ===
 // =====================================================================
-function findDevilMove() {
-  for (const card of devilHand) {
-    for (const p of [0, 1]) if (canDevilPlay(card, p)) return { card, pile: p };
-  }
-  return null;
-}
-
-function devilThink() {
-  if (!anteRunning || timers.devil || devilFinished) return;
-  if (!findDevilMove()) return;
-  let [min, max] = [500, 1500];
-  if (isFinalAnte(currentAnte)) [min, max] = [250, 800];
-  else if (isBossAnte(currentAnte)) [min, max] = [350, 1000];
-  const mult = getMods().devilSpeedMult;
-  const delay = randInt(Math.round(min * mult), Math.round(max * mult));
-  timers.devil = setTimeout(devilExecute, delay);
-}
-
-function devilExecute() {
-  timers.devil = null;
-  if (!anteRunning) return;
-  const move = findDevilMove();
-  if (!move) return;
-  devilHand.splice(devilHand.indexOf(move.card), 1);
-  centerPiles[move.pile].push(move.card);
-  while (devilHand.length < BASE_HAND_SIZE && devilStock.length) devilHand.push(devilStock.shift());
-  if (devilHand.length === 0 && devilStock.length === 0) {
-    devilFinished = true;
-    showToast('The Devil has emptied his hand. He watches you burn…', 2200);
-  }
-  renderAll();
-}
-
-// =====================================================================
-// === STALEMATE ===
-// =====================================================================
-function checkStalemate() {
-  const stuck = !playerHasMove() && !devilHasMove() && !timers.refill && !timers.devil;
+function checkStuck() {
+  const stuck = anteRunning && !playerHasMove() && !timers.refill && playerHand.length > 0;
   if (stuck) {
-    if (!timers.stalemate) timers.stalemate = setTimeout(resolveStalemate, STALEMATE_DELAY);
-    $('stalemate-banner').hidden = false;
-  } else if (timers.stalemate) {
-    clearTimeout(timers.stalemate);
-    timers.stalemate = null;
-    $('stalemate-banner').hidden = true;
+    if (!timers.flip) timers.flip = setTimeout(flipReserves, getMods().flipDelay);
+    $('btn-flip').hidden = !getMods().manualFlip;
+  } else {
+    if (timers.flip) { clearTimeout(timers.flip); timers.flip = null; }
+    $('btn-flip').hidden = true;
   }
 }
 
-function takeFlipCard(sources) {
-  for (const src of sources) {
-    if (!src.length) continue;
-    if (src === playerHand || src === devilHand) return src.splice(randInt(0, src.length - 1), 1)[0];
-    return src.shift();
-  }
-  return null;
-}
+function flipReserves() {
+  if (timers.flip) { clearTimeout(timers.flip); timers.flip = null; }
+  $('btn-flip').hidden = true;
+  if (!anteRunning || playerHasMove()) return;
 
-function resolveStalemate() {
-  timers.stalemate = null;
-  $('stalemate-banner').hidden = true;
-  if (!anteRunning) return;
-  const a = takeFlipCard([sidePiles[0], playerStock, playerHand]);
-  const b = takeFlipCard([sidePiles[1], devilStock, devilHand, sidePiles[0], playerStock]);
+  // Reserves empty? Recycle everything under the top cards back into the reserves.
+  if (sidePiles[0].length + sidePiles[1].length === 0) {
+    const recycled = [];
+    for (const p of [0, 1]) recycled.push(...centerPiles[p].splice(0, Math.max(0, centerPiles[p].length - 1)));
+    shuffle(recycled);
+    const half = Math.ceil(recycled.length / 2);
+    sidePiles = [recycled.slice(0, half), recycled.slice(half)];
+  }
+  // Last resort: nothing left anywhere but your own cards — push from stock/hand.
+  const a = sidePiles[0].shift() || sidePiles[1].shift() || playerStock.shift() || playerHand.splice(randInt(0, playerHand.length - 1), 1)[0];
+  const b = sidePiles[1].shift() || sidePiles[0].shift() || playerStock.shift() || playerHand.splice(randInt(0, playerHand.length - 1), 1)[0];
   if (a) centerPiles[0].push(a);
   if (b) centerPiles[1].push(b);
-  showToast('Stalemate! New cards flipped.', 1000);
+
+  if (hasJoker('deep_reserves')) grantBonus(0, 2);
   scheduleRefill();
   renderAll();
   checkWin();
@@ -675,10 +631,10 @@ function anteWon() {
     runActive = false;
     saveProgress();
     $('victory-summary').innerHTML = summaryRows([
-      ['Final ante reward', `+${r.total} 🪙`],
-      ['Chips earned during ante', `+${anteChipsEarned} 🪙`],
+      ['Final ante reward', `+${r.total} chips`],
+      ['Chips earned during ante', `+${anteChipsEarned}`],
       ['Time gained from jokers', `+${anteTimeGained}s`],
-      ['Final chip total', `${userChips} 🪙`],
+      ['Final chip total', `${userChips}`],
       ['Jokers collected', String(ownedMarketItems.length)],
     ]);
     $('modal-victory').hidden = false;
@@ -701,7 +657,7 @@ function anteWon() {
   if (r.interest) rows.push(['Hellish Interest', `+${r.interest}`]);
   rows.push(['Chips from jokers this ante', `+${anteChipsEarned}`]);
   rows.push(['Seconds gained this ante', `+${anteTimeGained}s`]);
-  rows.push(['Ante reward', `+${r.total} 🪙`, 'total']);
+  rows.push(['Ante reward', `+${r.total} chips`, 'total']);
   $('ante-won-summary').innerHTML = summaryRows(rows);
   $('modal-ante-won').hidden = false;
 }
@@ -712,7 +668,7 @@ function anteLost() {
   $('game-over-summary').innerHTML = summaryRows([
     ['Reached', `Ante ${currentAnte}${isBossAnte(currentAnte) ? ' (Boss)' : ''}`],
     ['Cards left', String(left)],
-    ['Chips lost', `${userChips} 🪙`],
+    ['Chips lost', `${userChips}`],
     ['Jokers lost', String(ownedMarketItems.length)],
   ]);
   resetGameProgress();
@@ -742,11 +698,11 @@ function buyMarketItem(key) {
   const item = itemByKey(key);
   if (!item) return;
   const price = itemPrice(item);
-  if (userChips < price) { showToast('Not enough chips!', 1200); return; }
+  if (userChips < price) { showToast('Not enough chips.', 1200); return; }
   userChips -= price;
   if (item.type === 'consumable') {
     const picked = applyEnhancement(ENHANCEMENT_MAP[key]);
-    showToast(picked ? `${cardName(picked)} became a ${capitalize(picked.enhancement || ENHANCEMENT_MAP[key])} Card!` : 'No card could be enhanced.', 1800);
+    showToast(picked ? `${cardName(picked)} became a ${capitalize(ENHANCEMENT_MAP[key])} Card.` : 'No card could be enhanced.', 1800);
     soldThisVisit.push(key);
   } else {
     ownedMarketItems.push(key);
@@ -765,7 +721,7 @@ function sellMarketItem(key) {
 }
 
 function rerollMarket() {
-  if (userChips < REROLL_COST) { showToast('Not enough chips to reroll!', 1200); return; }
+  if (userChips < REROLL_COST) { showToast('Not enough chips to reroll.', 1200); return; }
   userChips -= REROLL_COST;
   nextMarketItems = getRandomMarketItems();
   soldThisVisit = [];
@@ -775,7 +731,7 @@ function rerollMarket() {
 
 function renderMarket() {
   renderChips();
-  $('shop-chips').textContent = `Chips: ${userChips} 🪙`;
+  $('shop-chips').textContent = `${userChips} chips`;
   $('btn-reroll').disabled = userChips < REROLL_COST;
 
   $('shop-items').innerHTML = nextMarketItems.map((key) => {
@@ -783,13 +739,13 @@ function renderMarket() {
     const owned = ownedMarketItems.includes(key);
     const sold = owned || soldThisVisit.includes(key);
     const price = itemPrice(item);
-    const priceHtml = price !== item.price ? `<s>${item.price}</s>${price} 🪙` : `${price} 🪙`;
+    const priceHtml = price !== item.price ? `<s>${item.price}</s>${price} chips` : `${price} chips`;
     return `<div class="shop-item ${sold ? 'sold' : ''}">
       <span class="type">${item.type === 'consumable' ? 'Card Enhancement' : 'Joker'}</span>
       <span class="name">${item.name}</span>
       <span class="desc">${item.desc}</span>
       <span class="price">${priceHtml}</span>
-      <button class="btn btn-secondary btn-small buy-btn" data-key="${key}" ${sold || userChips < price ? 'disabled' : ''}>${sold ? 'Sold' : 'Buy'}</button>
+      <button class="btn btn-secondary buy-btn" data-key="${key}" ${sold || userChips < price ? 'disabled' : ''}>${sold ? 'Sold' : 'Buy'}</button>
     </div>`;
   }).join('');
 
@@ -798,7 +754,7 @@ function renderMarket() {
         const item = itemByKey(key);
         return `<div class="owned-row">
           <div><span class="name">${item.name}</span> <span class="desc">— ${item.desc}</span></div>
-          <button class="btn btn-ghost btn-small sell-btn" data-key="${key}">Sell (+${Math.floor(item.price / 2)} 🪙)</button>
+          <button class="btn btn-ghost btn-sm sell-btn" data-key="${key}">Sell · +${Math.floor(item.price / 2)}</button>
         </div>`;
       }).join('')
     : '<div class="empty-note">You own no jokers yet.</div>';
@@ -814,6 +770,7 @@ function cardHTML(card, opts = {}) {
   const cls = ['card', isRed(card) ? 'red' : 'black'];
   if (card.enhancement) cls.push(`enh-${card.enhancement}`);
   if (opts.playable) cls.push('playable');
+  if (opts.dim) cls.push('dim');
   if (opts.small) cls.push('small');
   const sym = SUIT_SYMBOL[card.suit];
   const r = rankLabel(card.rank);
@@ -821,10 +778,11 @@ function cardHTML(card, opts = {}) {
     <span class="corner tl">${r}<br>${sym}</span>
     <span class="pip">${sym}</span>
     <span class="corner br">${r}<br>${sym}</span>
+    ${opts.keyHint ? `<span class="key-hint">${opts.keyHint}</span>` : ''}
     ${card.enhancement ? `<span class="enh-tag">${card.enhancement}</span>` : ''}
   </div>`;
 }
-const cardBackHTML = (small = false) => `<div class="card-back ${small ? 'small' : ''}">🔥</div>`;
+const cardBackHTML = () => '<div class="card-back"></div>';
 
 function renderAll() {
   renderHud();
@@ -836,7 +794,7 @@ function renderAll() {
 function renderHud() {
   $('hud-ante').textContent = currentAnte;
   $('hud-boss-badge').hidden = !isBossAnte(currentAnte);
-  $('hud-boss-badge').textContent = isFinalAnte(currentAnte) ? 'FINAL BOSS' : 'BOSS';
+  $('hud-boss-badge').textContent = isFinalAnte(currentAnte) ? 'Final Boss' : 'Boss';
   renderChips();
   renderTimer();
   renderModifiers();
@@ -844,7 +802,7 @@ function renderHud() {
 }
 
 function renderChips() {
-  $('hud-chips').textContent = `Chips: ${userChips} 🪙`;
+  $('hud-chips').textContent = `${userChips} chips`;
 }
 
 function renderTimer() {
@@ -852,14 +810,14 @@ function renderTimer() {
   const el = $('hud-timer');
   el.textContent = Math.ceil(t);
   el.classList.toggle('low', anteRunning && t <= 15);
-  $('hud-timer-fill').style.width = `${clamp((t / anteTimeLimit) * 100, 0, 100)}%`;
+  $('hud-timer-fill').style.width = `${anteTimeLimit ? clamp((t / anteTimeLimit) * 100, 0, 100) : 100}%`;
 }
 
 function renderModifiers() {
   $('hud-modifiers').innerHTML = activeBossModifiers.map((m) => {
     let label = m.name;
     if (m.key === 'locked_number' && sealedRank !== null) label += ` (${rankLabel(sealedRank)})`;
-    return `<span class="mod-chip" title="${m.desc}">☠ ${label}</span>`;
+    return `<span class="tag mod" title="${m.desc}">${label}</span>`;
   }).join('');
 }
 
@@ -867,26 +825,22 @@ function renderJokers() {
   $('hud-jokers').innerHTML = ownedMarketItems.map((k) => {
     const item = itemByKey(k);
     const off = disabledJokers.includes(k);
-    return `<span class="joker-chip ${off ? 'disabled' : ''}" title="${item.desc}${off ? ' (SILENCED this ante)' : ''}">${item.name}</span>`;
+    return `<span class="tag joker ${off ? 'disabled' : ''}" title="${item.desc}${off ? ' (Silenced this ante)' : ''}">${item.name}</span>`;
   }).join('');
 }
 
 function renderHand() {
   const m = getMods();
   const slots = [];
-  playerHand.forEach((c) => {
-    const playable = anteRunning && (selectedPile !== null ? canPlayerPlay(c, selectedPile) : [0, 1].some((p) => canPlayerPlay(c, p)));
-    slots.push(cardHTML(c, { playable }));
+  playerHand.forEach((c, i) => {
+    const playable = anteRunning && (selectedPile !== null ? canPlay(c, selectedPile) : [0, 1].some((p) => canPlay(c, p)));
+    slots.push(cardHTML(c, { playable, dim: anteRunning && !playable, keyHint: i + 1 }));
   });
   for (let i = playerHand.length; i < m.handSize; i++) slots.push('<div class="empty-slot"></div>');
   $('player-hand').innerHTML = slots.join('');
   document.querySelectorAll('#player-hand .card').forEach((el) => {
     el.onclick = () => playerPlayCard(Number(el.dataset.id));
   });
-
-  const devilCards = [];
-  for (let i = 0; i < devilHand.length; i++) devilCards.push(cardBackHTML());
-  $('devil-hand').innerHTML = devilCards.join('') || '<div class="empty-slot"></div>';
 }
 
 function renderPiles() {
@@ -895,7 +849,7 @@ function renderPiles() {
     const top = topOf(p);
     el.innerHTML = (top ? cardHTML(top) : '') + `<span class="pile-count">${centerPiles[p].length}</span>`;
     el.classList.toggle('selected', selectedPile === p);
-    el.classList.toggle('targetable', anteRunning && selectedPile === null && playerHand.some((c) => canPlayerPlay(c, p)));
+    el.classList.toggle('targetable', anteRunning && selectedPile === null && playerHand.some((c) => canPlay(c, p)));
     $(`side-pile-${p}`).innerHTML = sidePiles[p].length ? cardBackHTML() + `<span class="pile-count">${sidePiles[p].length}</span>` : '';
   }
   $('player-stock').innerHTML = playerStock.length ? cardBackHTML() : '';
@@ -903,12 +857,9 @@ function renderPiles() {
 }
 
 function renderCounts() {
-  const pLeft = playerHand.length + playerStock.length;
-  const dLeft = devilHand.length + devilStock.length;
-  $('player-count').textContent = `${pLeft} cards left`;
-  $('devil-count').textContent = devilFinished ? 'Done!' : `${dLeft} cards left`;
-  $('player-progress').style.width = `${playerInitialCards ? (pLeft / playerInitialCards) * 100 : 0}%`;
-  $('devil-progress').style.width = `${devilInitialCards ? (dLeft / devilInitialCards) * 100 : 0}%`;
+  const left = playerHand.length + playerStock.length;
+  $('player-count').textContent = left;
+  $('player-progress').style.width = `${playerInitialCards ? (left / playerInitialCards) * 100 : 0}%`;
 }
 
 function floatText(text, cls, offsetX = 0) {
@@ -979,6 +930,7 @@ function wireEvents() {
   $('btn-reroll').onclick = rerollMarket;
   $('btn-game-over-menu').onclick = returnToMenu;
   $('btn-victory-menu').onclick = returnToMenu;
+  $('btn-flip').onclick = () => { if (getMods().manualFlip) flipReserves(); };
 
   // Click a center pile to pick it as the target, then click a card
   document.querySelectorAll('.center-pile').forEach((el) => {
@@ -991,10 +943,11 @@ function wireEvents() {
     };
   });
 
-  // Keyboard: 1-6 plays the nth card, Escape clears the pile selection
+  // Keyboard: 1-6 plays the nth card, Space flips reserves when stuck, Escape clears the pile selection
   document.addEventListener('keydown', (e) => {
     if (!anteRunning) return;
     if (e.key === 'Escape') { selectedPile = null; renderHand(); renderPiles(); return; }
+    if (e.key === ' ') { e.preventDefault(); if (!$('btn-flip').hidden) flipReserves(); return; }
     const n = Number(e.key);
     if (n >= 1 && n <= 6 && playerHand[n - 1]) playerPlayCard(playerHand[n - 1].id);
   });
