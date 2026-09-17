@@ -13,7 +13,6 @@ const TOTAL_ANTES = anteTimeLimits.length;
 const BOSS_TIME_FACTOR = 0.75;
 const BASE_HAND_SIZE = 5;
 const BASE_REFILL_DELAY = 350;   // ms until hand refills from stock
-const BASE_FLIP_DELAY = 1000;    // ms of being stuck before reserves flip automatically
 const SHOP_SIZE = 3;
 const REROLL_COST = 3;
 const SAVE_KEY = 'infernoSpeedSave';
@@ -77,7 +76,7 @@ const bossModifiers = [
   { key: 'locked_number', name: 'Sealed Rank', desc: 'A randomly chosen rank cannot be played this ante.' },
   { key: 'hand_of_four', name: 'Hand of Four', desc: 'Maximum hand size is 4 instead of 5 this ante.' },
   { key: 'no_joker_effects', name: 'Silenced Power', desc: 'Half of your owned jokers (randomly chosen) are disabled this ante.' },
-  { key: 'frozen_reserve', name: 'Frozen Reserve', desc: 'You cannot flip the reserves manually. Stuck? Wait 3 seconds for the automatic flip.' },
+  { key: 'frozen_reserve', name: 'Frozen Reserve', desc: 'Flipping the reserves costs 3 seconds this ante.' },
   { key: 'heavy_hand', name: 'Heavy Hand', desc: 'You are dealt 5 extra cards this ante.' },
   { key: 'greedy_devil', name: 'Greedy Devil', desc: "This ante's chip reward is halved." },
 ];
@@ -105,10 +104,11 @@ let secondWindUsed = false;
 let anteChipsEarned = 0, anteTimeGained = 0, cardsPlayedThisAnte = 0;
 let recentPlayTimes = [];
 let playerInitialCards = 0;
-let selectedPile = null;
+let lastPlayedId = null;
 let lastTick = 0;
 let cardIdCounter = 0;
-let timers = { loop: null, refill: null, flip: null, toast: null };
+let timers = { loop: null, refill: null, toast: null };
+let drag = null;   // active drag: { card, el, ghost, ox, oy }
 
 // === SHOP STATE ===
 let nextMarketItems = [];
@@ -157,8 +157,7 @@ function getMods() {
   const m = {
     handSize: BASE_HAND_SIZE + (has('steady_hand') ? 1 : 0),
     refillDelay: hasBoss('slow_draw') ? 1500 : BASE_REFILL_DELAY,
-    flipDelay: hasBoss('frozen_reserve') ? 3000 : BASE_FLIP_DELAY,
-    manualFlip: !hasBoss('frozen_reserve'),
+    flipCost: hasBoss('frozen_reserve') ? 3 : 0,
     wrap: has('infinity_loop'),
     rankStep: hasBoss('reverse_rule') ? 2 : 1,
     redAbundance: has('crimson_abundance'),
@@ -375,7 +374,7 @@ function startAnte() {
   secondWindUsed = false;
   anteChipsEarned = 0; anteTimeGained = 0; cardsPlayedThisAnte = 0;
   recentPlayTimes = [];
-  selectedPile = null;
+  lastPlayedId = null;
 
   refillHandNow();
   anteRunning = true;
@@ -387,10 +386,10 @@ function startAnte() {
 
 function stopLoop() {
   anteRunning = false;
-  for (const k of ['loop', 'refill', 'flip']) {
+  for (const k of ['loop', 'refill']) {
     if (timers[k]) { clearInterval(timers[k]); clearTimeout(timers[k]); timers[k] = null; }
   }
-  $('btn-flip').hidden = true;
+  cancelDrag();
 }
 
 function gameLoop() {
@@ -414,7 +413,6 @@ function gameLoop() {
       return;
     }
   }
-  checkStuck();
   renderTimer();
 }
 
@@ -449,27 +447,91 @@ const playerHasMove = () => playerHand.some((c) => [0, 1].some((p) => canPlay(c,
 // =====================================================================
 // === PLAYER ACTIONS ===
 // =====================================================================
-function playerPlayCard(cardId, pileIdx = null) {
-  if (!anteRunning) return;
+// Returns true if the card was played onto the given pile
+function playerPlayCard(cardId, pileIdx) {
+  if (!anteRunning) return false;
   const idx = playerHand.findIndex((c) => c.id === cardId);
-  if (idx < 0) return;
+  if (idx < 0) return false;
   const card = playerHand[idx];
-
-  let target = pileIdx !== null ? pileIdx : selectedPile;
-  if (target === null) target = [0, 1].find((p) => canPlay(card, p));
-  if (target === undefined || target === null || !canPlay(card, target)) {
-    const el = document.querySelector(`#player-hand .card[data-id="${cardId}"]`);
-    if (el) { el.classList.add('shake'); setTimeout(() => el.classList.remove('shake'), 300); }
-    return;
-  }
+  if (!canPlay(card, pileIdx)) return false;
 
   playerHand.splice(idx, 1);
-  centerPiles[target].push(card);
-  selectedPile = null;
+  centerPiles[pileIdx].push(card);
+  lastPlayedId = card.id;
   onPlayerCardPlayed(card);
   scheduleRefill();
   renderAll();
   checkWin();
+  return true;
+}
+
+function shakeCard(cardId) {
+  const el = document.querySelector(`#player-hand .card[data-id="${cardId}"]`);
+  if (el) { el.classList.add('shake'); setTimeout(() => el.classList.remove('shake'), 300); }
+}
+
+// =====================================================================
+// === DRAG & DROP ===
+// =====================================================================
+function startDrag(e, card, el) {
+  if (!anteRunning || drag || e.button > 0) return;
+  e.preventDefault();
+  const rect = el.getBoundingClientRect();
+  const ghost = el.cloneNode(true);
+  ghost.classList.add('drag-ghost');
+  ghost.classList.remove('dragging');
+  ghost.style.setProperty('--rot', '0deg');
+  ghost.style.setProperty('--lift', '0px');
+  ghost.style.width = `${rect.width}px`;
+  ghost.style.height = `${rect.height}px`;
+  ghost.style.left = `${rect.left}px`;
+  ghost.style.top = `${rect.top}px`;
+  $('drag-layer').appendChild(ghost);
+  el.classList.add('dragging');
+  drag = { card, el, ghost, ox: e.clientX - rect.left, oy: e.clientY - rect.top, hover: null };
+}
+
+function onDragMove(e) {
+  if (!drag) return;
+  e.preventDefault();
+  drag.ghost.style.left = `${e.clientX - drag.ox}px`;
+  drag.ghost.style.top = `${e.clientY - drag.oy}px`;
+  const pile = pileAt(e.clientX, e.clientY);
+  if (pile !== drag.hover) {
+    drag.hover = pile;
+    document.querySelectorAll('.center-pile').forEach((p) => p.classList.toggle('hover', Number(p.dataset.pile) === pile));
+  }
+}
+
+function onDragEnd(e) {
+  if (!drag) return;
+  const { card } = drag;
+  const pile = pileAt(e.clientX, e.clientY);
+  cancelDrag();
+  if (pile === null) { renderHand(); return; }
+  if (!playerPlayCard(card.id, pile)) { renderHand(); shakeCard(card.id); }
+}
+
+function cancelDrag() {
+  if (!drag) return;
+  drag.ghost.remove();
+  drag.el.classList.remove('dragging');
+  document.querySelectorAll('.center-pile').forEach((p) => p.classList.remove('hover'));
+  drag = null;
+}
+
+// Which center pile (0/1) is under the screen point, or null.
+// Uses projected bounding boxes (works on the 3D-tilted table where hit testing is unreliable).
+function pileAt(x, y) {
+  const pad = 14;
+  let best = null, bestDist = Infinity;
+  for (const p of [0, 1]) {
+    const r = $(`center-pile-${p}`).getBoundingClientRect();
+    if (x < r.left - pad || x > r.right + pad || y < r.top - pad || y > r.bottom + pad) continue;
+    const d = Math.hypot(x - (r.left + r.width / 2), y - (r.top + r.height / 2));
+    if (d < bestDist) { best = p; bestDist = d; }
+  }
+  return best;
 }
 
 function scheduleRefill() {
@@ -559,23 +621,19 @@ function checkWin() {
 }
 
 // =====================================================================
-// === STUCK / FLIPPING RESERVES ===
+// === FLIPPING RESERVES (manual only) ===
 // =====================================================================
-function checkStuck() {
-  const stuck = anteRunning && !playerHasMove() && !timers.refill && playerHand.length > 0;
-  if (stuck) {
-    if (!timers.flip) timers.flip = setTimeout(flipReserves, getMods().flipDelay);
-    $('btn-flip').hidden = !getMods().manualFlip;
-  } else {
-    if (timers.flip) { clearTimeout(timers.flip); timers.flip = null; }
-    $('btn-flip').hidden = true;
-  }
-}
-
 function flipReserves() {
-  if (timers.flip) { clearTimeout(timers.flip); timers.flip = null; }
-  $('btn-flip').hidden = true;
-  if (!anteRunning || playerHasMove()) return;
+  if (!anteRunning) return;
+  if (timers.refill) return;
+  if (playerHasMove()) {
+    const b = $('btn-flip');
+    b.classList.add('shake'); setTimeout(() => b.classList.remove('shake'), 300);
+    showToast('You can still play a card.', 1000);
+    return;
+  }
+  const cost = getMods().flipCost;
+  if (cost) { timeRemaining -= cost; floatText(`-${cost}s`, 'bad'); }
 
   // Reserves empty? Recycle everything under the top cards back into the reserves.
   if (sidePiles[0].length + sidePiles[1].length === 0) {
@@ -769,20 +827,24 @@ function renderMarket() {
 function cardHTML(card, opts = {}) {
   const cls = ['card', isRed(card) ? 'red' : 'black'];
   if (card.enhancement) cls.push(`enh-${card.enhancement}`);
-  if (opts.playable) cls.push('playable');
-  if (opts.dim) cls.push('dim');
   if (opts.small) cls.push('small');
+  if (opts.enter) cls.push('enter');
   const sym = SUIT_SYMBOL[card.suit];
   const r = rankLabel(card.rank);
-  return `<div class="${cls.join(' ')}" data-id="${card.id || ''}" title="${cardName(card)}${card.enhancement ? ' (' + capitalize(card.enhancement) + ')' : ''}">
+  return `<div class="${cls.join(' ')}" data-id="${card.id || ''}" style="${opts.style || ''}" title="${cardName(card)}${card.enhancement ? ' (' + capitalize(card.enhancement) + ')' : ''}">
     <span class="corner tl">${r}<br>${sym}</span>
     <span class="pip">${sym}</span>
     <span class="corner br">${r}<br>${sym}</span>
-    ${opts.keyHint ? `<span class="key-hint">${opts.keyHint}</span>` : ''}
     ${card.enhancement ? `<span class="enh-tag">${card.enhancement}</span>` : ''}
   </div>`;
 }
-const cardBackHTML = () => '<div class="card-back"></div>';
+// A face-down stack: up to 3 layered backs so piles read as having depth
+function stackHTML(count) {
+  const layers = Math.min(3, count);
+  let html = '';
+  for (let i = layers - 1; i >= 0; i--) html += `<div class="card-back stack-${i}"></div>`;
+  return html;
+}
 
 function renderAll() {
   renderHud();
@@ -830,16 +892,20 @@ function renderJokers() {
 }
 
 function renderHand() {
+  cancelDrag();
   const m = getMods();
-  const slots = [];
-  playerHand.forEach((c, i) => {
-    const playable = anteRunning && (selectedPile !== null ? canPlay(c, selectedPile) : [0, 1].some((p) => canPlay(c, p)));
-    slots.push(cardHTML(c, { playable, dim: anteRunning && !playable, keyHint: i + 1 }));
+  const n = playerHand.length;
+  const slots = playerHand.map((c, i) => {
+    const off = i - (n - 1) / 2;                      // fan: spread around the middle card
+    const style = `--rot:${(off * 4).toFixed(1)}deg;--lift:${(Math.abs(off) * 3).toFixed(1)}px`;
+    return cardHTML(c, { style });
   });
-  for (let i = playerHand.length; i < m.handSize; i++) slots.push('<div class="empty-slot"></div>');
+  for (let i = n; i < m.handSize; i++) slots.push('<div class="empty-slot"></div>');
   $('player-hand').innerHTML = slots.join('');
   document.querySelectorAll('#player-hand .card').forEach((el) => {
-    el.onclick = () => playerPlayCard(Number(el.dataset.id));
+    const card = playerHand.find((c) => c.id === Number(el.dataset.id));
+    el.onpointerdown = (e) => startDrag(e, card, el);
+    el.ondragstart = () => false;
   });
 }
 
@@ -847,12 +913,12 @@ function renderPiles() {
   for (const p of [0, 1]) {
     const el = $(`center-pile-${p}`);
     const top = topOf(p);
-    el.innerHTML = (top ? cardHTML(top) : '') + `<span class="pile-count">${centerPiles[p].length}</span>`;
-    el.classList.toggle('selected', selectedPile === p);
-    el.classList.toggle('targetable', anteRunning && selectedPile === null && playerHand.some((c) => canPlay(c, p)));
-    $(`side-pile-${p}`).innerHTML = sidePiles[p].length ? cardBackHTML() + `<span class="pile-count">${sidePiles[p].length}</span>` : '';
+    const under = centerPiles[p].length > 1 ? stackHTML(centerPiles[p].length - 1) : '';
+    el.innerHTML = under + (top ? cardHTML(top, { enter: top.id === lastPlayedId }) : '') + `<span class="pile-count">${centerPiles[p].length}</span>`;
+    $(`side-pile-${p}`).innerHTML = sidePiles[p].length ? stackHTML(sidePiles[p].length) + `<span class="pile-count">${sidePiles[p].length}</span>` : '';
   }
-  $('player-stock').innerHTML = playerStock.length ? cardBackHTML() : '';
+  lastPlayedId = null;
+  $('player-stock').innerHTML = playerStock.length ? stackHTML(playerStock.length) : '';
   $('player-stock-count').textContent = playerStock.length;
 }
 
@@ -930,27 +996,13 @@ function wireEvents() {
   $('btn-reroll').onclick = rerollMarket;
   $('btn-game-over-menu').onclick = returnToMenu;
   $('btn-victory-menu').onclick = returnToMenu;
-  $('btn-flip').onclick = () => { if (getMods().manualFlip) flipReserves(); };
+  $('btn-flip').onclick = flipReserves;
 
-  // Click a center pile to pick it as the target, then click a card
-  document.querySelectorAll('.center-pile').forEach((el) => {
-    el.onclick = () => {
-      if (!anteRunning) return;
-      const p = Number(el.dataset.pile);
-      selectedPile = selectedPile === p ? null : p;
-      renderHand();
-      renderPiles();
-    };
-  });
-
-  // Keyboard: 1-6 plays the nth card, Space flips reserves when stuck, Escape clears the pile selection
-  document.addEventListener('keydown', (e) => {
-    if (!anteRunning) return;
-    if (e.key === 'Escape') { selectedPile = null; renderHand(); renderPiles(); return; }
-    if (e.key === ' ') { e.preventDefault(); if (!$('btn-flip').hidden) flipReserves(); return; }
-    const n = Number(e.key);
-    if (n >= 1 && n <= 6 && playerHand[n - 1]) playerPlayCard(playerHand[n - 1].id);
-  });
+  // Drag & drop (pointer events cover mouse, touch and pen)
+  window.addEventListener('pointermove', onDragMove, { passive: false });
+  window.addEventListener('pointerup', onDragEnd);
+  window.addEventListener('pointercancel', cancelDrag);
+  window.addEventListener('blur', cancelDrag);
 }
 
 document.addEventListener('DOMContentLoaded', () => {

@@ -14,9 +14,9 @@ Open `index.html` in any modern browser. No build step, no dependencies.
 
 ## Controls
 
-- Click a card to play it onto any valid pile, or click a pile first to aim.
-- Keys `1`–`6` play the nth card in your hand. `Esc` clears the pile selection.
-- `Space` (or the Flip button) flips new cards from the reserves when you are stuck. It also happens automatically after a short delay.
+- **Drag** a card from your hand onto a center pile. Invalid drops shake and return to your hand. There are no hints about which cards are playable.
+- **Flip Reserves** turns new cards onto both piles. It only works when you have no legal move, and nothing flips on its own.
+- Works with mouse, touch and pen (pointer events). The table is rendered in CSS 3D; the layout adapts to portrait phones.
 
 ## Files
 
